@@ -57,7 +57,7 @@ async function getStream(id, season, episode) {
   }
   const data = await res.json();
   const playlist = data?.stream?.playlist;
-  if (!playlist) throw new Error('No playlist in response');
+  if (!playlist) throw new Error('No playlist. Response: ' + JSON.stringify(data).slice(0, 600));
   return playlist;
 }
 
