@@ -51,7 +51,10 @@ async function getStream(id, season, episode) {
   const res = await fetch(apiUrl, {
     headers: { Referer: REFERER, Origin: ORIGIN, 'User-Agent': UA }
   });
-  if (!res.ok) throw new Error(`vidlink API returned ${res.status}`);
+    if (!res.ok) {
+    const txt = (await res.text()).slice(0, 300);
+    throw new Error(`vidlink API returned ${res.status}: ${txt}`);
+  }
   const data = await res.json();
   const playlist = data?.stream?.playlist;
   if (!playlist) throw new Error('No playlist in response');
