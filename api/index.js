@@ -41,9 +41,63 @@ function bootWasm() {
 }
 
 // ── Stream URL resolver ───────────────────────────────────────────────────────
+// vidlink answers in several shapes depending on who asks. The browser gets a DASH stream
+// (stream.playlist + CloudFront cookies, played through vidlink's "surge" proxy); some clients get
+// mp4 "qualities" whose links the CDN rejects. We ask like a browser and prefer dash/hls.
+const SURGE = 'https://surge.flooderrr.store';
+
+// Same URL scheme vidlink's own player uses:
+//   <surge>/<first label of cdn host><path>?host=<cdn origin>&sc=<base64(cookie header)>
+function surgeDash(playlist, cookie) {
+  const u = new URL(playlist);
+  const label = u.hostname.split('.')[0];
+  const sc = Buffer.from(cookie, 'utf8').toString('base64');
+  return `${SURGE}/${label}${u.pathname}?host=${encodeURIComponent(u.origin)}&sc=${encodeURIComponent(sc)}`;
+}
+
+function playableFrom(o) {
+  if (!o || typeof o.playlist !== 'string') return null;
+  const ph = o.playlistHeaders || o.headers || {};
+  const cookie = ph.Cookie || ph.cookie;
+  const isDash = o.type === 'dash' || /\.mpd(\?|$)/i.test(o.playlist);
+  if (isDash) {
+    return { type: 'dash', url: (o.requiresProxy && cookie) ? surgeDash(o.playlist, cookie) : o.playlist };
+  }
+  return { type: 'hls', url: o.playlist };
+}
+
+function fileResult(s, wantedQuality) {
+  if (!s?.qualities || typeof s.qualities !== 'object') return null;
+  const qualities = {};
+  for (const [k, v] of Object.entries(s.qualities)) {
+    if (v && v.url) qualities[k] = { url: v.url, type: v.type, codec: v.codecName, size: v.size };
+  }
+  const keys = Object.keys(qualities).sort((a, b) => parseInt(b) - parseInt(a));
+  if (!keys.length) return null;
+  const pick = wantedQuality && qualities[wantedQuality] ? wantedQuality : keys[0];
+  return { url: qualities[pick].url, type: 'file', quality: pick, qualities };
+}
+
+const VIDLINK_PROFILES = [
+  pageUrl => ({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36',
+    Accept: '*/*', 'Accept-Language': 'en-US,en;q=0.9',
+    Referer: pageUrl, Origin: ORIGIN,
+    'sec-ch-ua': '"Chromium";v="158", "Not.A/Brand";v="24", "Google Chrome";v="158"',
+    'sec-ch-ua-mobile': '?0', 'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin',
+  }),
+  pageUrl => ({
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36',
+    Accept: '*/*', Referer: pageUrl, Origin: ORIGIN,
+  }),
+  () => ({ 'User-Agent': UA, Referer: REFERER, Origin: ORIGIN }),
+];
+
 // Returns:
-//   HLS source  -> { url, type: 'hls' }
-//   MP4 source  -> { url, type: 'file', quality, qualities: { "360": {url,...}, ... } }
+//   dash -> { type:'dash', url:<surge mpd url>, captions }
+//   hls  -> { type:'hls',  url }
+//   file -> { type:'file', url, quality, qualities }   (last resort; CDN usually rejects these)
 async function getStream(id, season, episode, wantedQuality) {
   await bootWasm();
   const token = globalThis.getAdv(String(id));
@@ -52,35 +106,47 @@ async function getStream(id, season, episode, wantedQuality) {
   const apiUrl = season
     ? `https://vidlink.pro/api/b/tv/${token}/${season}/${episode || 1}?multiLang=0`
     : `https://vidlink.pro/api/b/movie/${token}?multiLang=0`;
+  const pageUrl = season
+    ? `https://vidlink.pro/tv/${id}/${season}/${episode || 1}`
+    : `https://vidlink.pro/movie/${id}`;
 
-  const res = await fetch(apiUrl, {
-    headers: { Referer: REFERER, Origin: ORIGIN, 'User-Agent': UA }
-  });
-  if (!res.ok) {
-    const txt = (await res.text()).slice(0, 300);
-    throw new Error(`vidlink API returned ${res.status}: ${txt}`);
-  }
-  const data = await res.json();
-  const s = data?.stream;
-
-  // Old format: HLS playlist
-  if (s?.playlist) return { url: s.playlist, type: 'hls', captions: s.captions };
-
-  // New format: direct mp4 files per quality
-  if (s?.qualities && typeof s.qualities === 'object') {
-    const qualities = {};
-    for (const [k, v] of Object.entries(s.qualities)) {
-      if (v && v.url) {
-        qualities[k] = { url: v.url, type: v.type, codec: v.codecName, size: v.size };
+  let fallback = null;
+  let lastErr = null;
+  for (let i = 0; i < VIDLINK_PROFILES.length; i++) {
+    try {
+      const res = await fetch(apiUrl, { headers: VIDLINK_PROFILES[i](pageUrl) });
+      if (!res.ok) {
+        const txt = (await res.text()).slice(0, 300);
+        lastErr = new Error(`vidlink API returned ${res.status}: ${txt}`);
+        continue;
       }
-    }
-    const keys = Object.keys(qualities).sort((a, b) => parseInt(b) - parseInt(a));
-    if (!keys.length) throw new Error('qualities was empty');
-    const pick = wantedQuality && qualities[wantedQuality] ? wantedQuality : keys[0];
-    return { url: qualities[pick].url, type: 'file', quality: pick, qualities, captions: s.captions };
-  }
+      const data = await res.json();
+      const s = data?.stream;
+      const meta = { captions: s?.captions, ttl: s?.TTL, source: data?.sourceId, attempt: i + 1 };
 
-  throw new Error('Unknown response shape: ' + JSON.stringify(data).slice(0, 400));
+      const direct = playableFrom(s);
+      if (direct) return { ...direct, ...meta };
+
+      // qualities that are themselves dash/hls entries
+      if (s?.qualities && typeof s.qualities === 'object') {
+        const entries = Object.entries(s.qualities)
+          .map(([k, v]) => [k, playableFrom(v)]).filter(([, p]) => p);
+        if (entries.length) {
+          entries.sort((a, b) => parseInt(b[0]) - parseInt(a[0]));
+          const pick = entries.find(([k]) => k === wantedQuality) || entries[0];
+          return { ...pick[1], quality: pick[0], ...meta };
+        }
+      }
+
+      const f = fileResult(s, wantedQuality);
+      if (f && !fallback) fallback = { ...f, ...meta };
+      if (!f) lastErr = new Error('Unknown response shape: ' + JSON.stringify(data).slice(0, 400));
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (fallback) return fallback;
+  throw lastErr || new Error('No stream found');
 }
 
 // ── Upstream fetcher with redirect + Range support ────────────────────────────
