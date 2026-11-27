@@ -84,17 +84,41 @@ async function getStream(id, season, episode, wantedQuality) {
 }
 
 // ── Upstream fetcher with redirect + Range support ────────────────────────────
-// Tries full vidlink headers first; if the CDN answers 403/429 it retries with fewer headers
-const HEADER_SETS = [
-  { Referer: REFERER, Origin: ORIGIN, 'User-Agent': UA, Accept: '*/*' },
-  { 'User-Agent': UA, Accept: '*/*' },
-  { Accept: '*/*' },
+// Header sets are chosen per host. The MovieBox CDN (hakunaymatata.com) only serves requests whose
+// Referer is a MovieBox site, so we try those in turn and remember the one that works.
+const CDN_HOST_RE = /hakunaymatata\.com$/i;
+const CDN_REFERERS = [
+  'https://themoviebox.xyz/',
+  'https://h5.aoneroom.com/',
+  'https://moviebox.ph/',
+  'https://videasy.net/',
 ];
+let goodCdnReferer = null; // survives warm invocations
+
+function headerSetsFor(url) {
+  const base = { 'User-Agent': UA, Accept: '*/*' };
+  let host = '';
+  try { host = new URL(url).hostname; } catch (e) {}
+  if (CDN_HOST_RE.test(host)) {
+    const refs = goodCdnReferer
+      ? [goodCdnReferer, ...CDN_REFERERS.filter(r => r !== goodCdnReferer)]
+      : CDN_REFERERS;
+    return [...refs.map(r => ({ ...base, Referer: r, Origin: r.replace(/\/$/, '') })), base];
+  }
+  return [
+    { ...base, Referer: REFERER, Origin: ORIGIN },
+    base,
+    { Accept: '*/*' },
+  ];
+}
+
+const RETRY_STATUS = new Set([401, 403, 428, 429]);
 
 function fetchUpstream(url, range, mode = 0, redirects = 0) {
   return new Promise((resolve, reject) => {
     if (redirects > 5) return reject(new Error('too many redirects'));
-    const headers = { ...HEADER_SETS[mode] };
+    const sets = headerSetsFor(url);
+    const headers = { ...sets[mode] };
     if (range) headers.Range = range;
     (url.startsWith('https') ? https : http).get(url, { headers }, res => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
@@ -102,9 +126,12 @@ function fetchUpstream(url, range, mode = 0, redirects = 0) {
         res.resume();
         return resolve(fetchUpstream(loc.startsWith('http') ? loc : new URL(loc, url).href, range, mode, redirects + 1));
       }
-      if ((res.statusCode === 403 || res.statusCode === 429) && mode < HEADER_SETS.length - 1) {
+      if (RETRY_STATUS.has(res.statusCode) && mode < sets.length - 1) {
         res.resume();
         return resolve(fetchUpstream(url, range, mode + 1, redirects));
+      }
+      if (res.statusCode < 400 && headers.Referer && CDN_REFERERS.includes(headers.Referer)) {
+        goodCdnReferer = headers.Referer;
       }
       resolve(res);
     }).on('error', reject);
