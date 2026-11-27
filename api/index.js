@@ -84,16 +84,27 @@ async function getStream(id, season, episode, wantedQuality) {
 }
 
 // ── Upstream fetcher with redirect + Range support ────────────────────────────
-function fetchUpstream(url, range, redirects = 0) {
+// Tries full vidlink headers first; if the CDN answers 403/429 it retries with fewer headers
+const HEADER_SETS = [
+  { Referer: REFERER, Origin: ORIGIN, 'User-Agent': UA, Accept: '*/*' },
+  { 'User-Agent': UA, Accept: '*/*' },
+  { Accept: '*/*' },
+];
+
+function fetchUpstream(url, range, mode = 0, redirects = 0) {
   return new Promise((resolve, reject) => {
     if (redirects > 5) return reject(new Error('too many redirects'));
-    const headers = { Referer: REFERER, Origin: ORIGIN, 'User-Agent': UA, Accept: '*/*' };
+    const headers = { ...HEADER_SETS[mode] };
     if (range) headers.Range = range;
     (url.startsWith('https') ? https : http).get(url, { headers }, res => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         const loc = res.headers.location;
         res.resume();
-        return resolve(fetchUpstream(loc.startsWith('http') ? loc : new URL(loc, url).href, range, redirects + 1));
+        return resolve(fetchUpstream(loc.startsWith('http') ? loc : new URL(loc, url).href, range, mode, redirects + 1));
+      }
+      if ((res.statusCode === 403 || res.statusCode === 429) && mode < HEADER_SETS.length - 1) {
+        res.resume();
+        return resolve(fetchUpstream(url, range, mode + 1, redirects));
       }
       resolve(res);
     }).on('error', reject);
@@ -128,6 +139,20 @@ module.exports = async function handler(req, res) {
     try {
       const upstream = await fetchUpstream(url, req.headers.range);
       const ct = (upstream.headers['content-type'] || '').toLowerCase();
+
+      // Upstream refused us: report the real reason instead of piping an HTML error page as "video"
+      if (upstream.statusCode >= 400 && upstream.statusCode !== 416) {
+        const chunks = []; let n = 0;
+        for await (const c of upstream) { chunks.push(c); n += c.length; if (n > 2000) break; }
+        upstream.destroy();
+        res.statusCode = 502;
+        res.setHeader('Content-Type', 'application/json');
+        return res.end(JSON.stringify({
+          error: 'upstream ' + upstream.statusCode,
+          contentType: ct,
+          snippet: Buffer.concat(chunks).toString('utf8').replace(/\s+/g, ' ').slice(0, 300)
+        }));
+      }
       const isM3u8 = ct.includes('mpegurl') || ct.includes('m3u8') || /\.m3u8?(\?|$)/i.test(url.split('?')[0]);
 
       if (isM3u8) {
