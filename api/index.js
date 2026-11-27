@@ -78,18 +78,22 @@ function fileResult(s, wantedQuality) {
   return { url: qualities[pick].url, type: 'file', quality: pick, qualities };
 }
 
+// "x-playback-environment: dash-hevc" is what makes vidlink answer with the DASH stream
+// (the browser sends it when it can decode HEVC). Without it we only got the dead mp4 list.
+const PLAYBACK_ENV = 'dash-hevc';
 const VIDLINK_PROFILES = [
   pageUrl => ({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36',
-    Accept: '*/*', 'Accept-Language': 'en-US,en;q=0.9',
+    Accept: '*/*', 'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
     Referer: pageUrl, Origin: ORIGIN,
+    'x-playback-environment': PLAYBACK_ENV,
     'sec-ch-ua': '"Chromium";v="158", "Not.A/Brand";v="24", "Google Chrome";v="158"',
     'sec-ch-ua-mobile': '?0', 'sec-ch-ua-platform': '"Windows"',
     'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin',
   }),
   pageUrl => ({
-    'User-Agent': 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36',
-    Accept: '*/*', Referer: pageUrl, Origin: ORIGIN,
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36',
+    Accept: '*/*', Referer: pageUrl, 'x-playback-environment': PLAYBACK_ENV,
   }),
   () => ({ 'User-Agent': UA, Referer: REFERER, Origin: ORIGIN }),
 ];
