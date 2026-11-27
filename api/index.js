@@ -284,6 +284,13 @@ module.exports = async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json');
   try {
     const out = await getStream(q.id, q.s, q.e, q.q);
+    if (out.type === 'dash' && out.url.startsWith(SURGE)) {
+      // surge only talks to vidlink.pro; route it through our own relay (api/surge/[...path].js)
+      const proto = req.headers['x-forwarded-proto'] || 'https';
+      const base = `${proto}://${req.headers['x-forwarded-host'] || req.headers.host}`;
+      out.directUrl = out.url;
+      out.url = base + '/api/surge' + out.url.slice(SURGE.length);
+    }
     res.end(JSON.stringify(out));
   } catch (err) {
     res.statusCode = 500;
